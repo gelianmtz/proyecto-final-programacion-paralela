@@ -1,0 +1,65 @@
+OpenMP threads: 16
+Resolution: 7680 x 4320
+Task A benchmark: 1 warmup + 3 timed runs (median reported)
+
+OpenMP default static (no chunk): 1.120 s
+
+Testing schedule(static) ...
+  chunk=    1  0.600 s
+  chunk=    2  0.598 s
+  chunk=    4  0.556 s
+  chunk=    8  0.553 s
+  chunk=   16  0.548 s
+  chunk=   32  0.605 s
+  chunk=   64  0.563 s
+  chunk=  128  0.716 s
+  chunk=  256  1.084 s
+  chunk=  512  1.953 s
+  chunk= 1024  3.131 s
+  chunk= 2048  3.593 s
+  chunk= 4320  6.323 s
+
+Testing schedule(dynamic) ...
+  chunk=    1  0.564 s
+  chunk=    2  0.549 s
+  chunk=    4  0.550 s
+  chunk=    8  0.564 s
+  chunk=   16  0.707 s
+  chunk=   32  0.705 s
+  chunk=   64  0.713 s
+  chunk=  128  0.922 s
+  chunk=  256  1.640 s
+  chunk=  512  3.066 s
+  chunk= 1024  4.968 s
+  chunk= 2048  5.716 s
+  chunk= 4320  10.022 s
+
+Testing schedule(guided) ...
+  chunk=    1  0.927 s
+  chunk=    2  0.936 s
+  chunk=    4  0.924 s
+  chunk=    8  0.924 s
+  chunk=   16  0.929 s
+  chunk=   32  0.918 s
+  chunk=   64  0.934 s
+  chunk=  128  0.934 s
+  chunk=  256  1.633 s
+  chunk=  512  3.062 s
+  chunk= 1024  4.964 s
+  chunk= 2048  5.733 s
+  chunk= 4320  10.089 s
+
+=== Summary ===
+Static default (schedule(static), implicit chunk): 1.120 s
+Best explicit: schedule(static), chunk=16, 0.548 s
+Speedup vs static default: 2.04x
+
+Top 5 configurations:
+  schedule   chunk   time (s)
+    static      16        0.55
+   dynamic       2        0.55
+   dynamic       4        0.55
+    static       8        0.55
+    static       4        0.56
+
+Full results: benchmark_task_a.csv

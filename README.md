@@ -1,47 +1,66 @@
-# Fractal + convolution (sequential baseline)
+# Fractal + convolution (OpenMP parallel baseline)
 
-Purely sequential C++ program for a parallel-programming course baseline:
+OpenMP-parallel C++ pipeline:
 
 1. **Task A** — Render the Mandelbrot set at **8K UHD** (7680×4320).
-2. **Task B** — Apply a **heavy 2D convolution** to the image:
-   - **Gaussian** (default): full naive 2D kernel, radius 25 (51×51).
-   - **Sobel**: edge map on luminance via 3×3 kernels.
+2. **Task B** — Apply a **heavy 2D convolution** (Gaussian or Sobel), parallelized by row.
 
 ## Build
 
+With CMake (recommended):
+
 ```bash
 cmake -S . -B build
 cmake --build build --config Release
 ```
 
-On Windows with Visual Studio:
-
-```powershell
-cmake -S . -B build
-cmake --build build --config Release
-.\build\Release\fractal_convolve_sequential.exe
-```
-
-## Run
+With g++ (MSYS2 / MinGW):
 
 ```bash
-./build/fractal_convolve_sequential          # Gaussian blur
-./build/fractal_convolve_sequential sobel    # Sobel edges
+g++ -std=c++17 -O2 -fopenmp -Wall -Wextra -o build/fractal_convolve_parallel.exe src/main.cpp
 ```
 
-Outputs (binary PPM):
-
-- `mandelbrot_8k.ppm` — raw fractal
-- `mandelbrot_8k_blur.ppm` or `mandelbrot_8k_sobel.ppm` — filtered result
-
-View PPM files with ImageMagick, GIMP, IrfanView, or:
+## Run full pipeline
 
 ```bash
-magick mandelbrot_8k.ppm mandelbrot_8k.png
+./build/fractal_convolve_parallel
+./build/fractal_convolve_parallel sobel
 ```
 
-## Performance note
+## Task A scheduler benchmark
 
-At 8K with a 51×51 Gaussian, Task B is intentionally expensive (billions of multiply-adds). Expect long runtimes on a single core; that is suitable as a **sequential baseline** before parallelizing.
+Compares `schedule(static)`, `schedule(dynamic)`, and `schedule(guided)` over chunk sizes  
+`1, 2, 4, …, 4320` (median of 3 runs after 1 warmup):
 
-To experiment faster during development, temporarily lower `kWidth` / `kHeight` or `kBlurRadius` in `src/main.cpp`.
+```bash
+./build/fractal_convolve_parallel --benchmark-a
+```
+
+Writes `benchmark_task_a.csv` and prints the best configuration for your CPU.
+
+Control thread count:
+
+```bash
+export OMP_NUM_THREADS=16    # Linux/macOS
+set OMP_NUM_THREADS=16       # Windows cmd
+$env:OMP_NUM_THREADS=16      # PowerShell
+```
+
+### Empirical result (16-thread run, 7680×4320)
+
+| Configuration | Median Task A time |
+|---------------|-------------------|
+| **static, chunk=16** (best) | **0.548 s** |
+| dynamic, chunk=2–4 | ~0.55 s |
+| static default (implicit chunk) | 1.120 s |
+| guided, chunk=1–64 | ~0.92–0.93 s |
+
+**Conclusion for this CPU:** `schedule(static, 16)` wins. Mandelbrot rows have uneven cost (more iterations inside the set); a modest static chunk balances load without the overhead of `dynamic` or the coarse decay of `guided`. Large chunks (512+) hurt badly because they serialize the heavy central rows onto fewer threads.
+
+Re-run `--benchmark-a` after changing `OMP_NUM_THREADS` or hardware.
+
+## Outputs
+
+- `mandelbrot_8k.ppm` — fractal
+- `mandelbrot_8k_blur.ppm` or `mandelbrot_8k_sobel.ppm` — filtered image
+- `benchmark_task_a.csv` — scheduler sweep results
