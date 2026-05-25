@@ -309,6 +309,39 @@ void run_scheduler_benchmark() {
     std::cout << "\nFull results: benchmark_task_a.csv\n";
 }
 
+void run_thread_benchmark() {
+    const int logical_cores = omp_get_num_procs();
+    const int max_threads = 2 * logical_cores;
+    constexpr ScheduleKind kSched = ScheduleKind::Static;
+    constexpr int kChunk = 16;
+
+    std::cout << "Task A thread scaling (schedule static, chunk " << kChunk << ")\n";
+    std::cout << "Logical cores: " << logical_cores << ", sweep: 1.." << max_threads
+              << " threads\n";
+    std::cout << kBenchmarkWarmup << " warmup + " << kBenchmarkReps
+              << " timed runs (median)\n\n";
+
+    std::ofstream csv("benchmark_threads.csv");
+    csv << "threads,seconds,speedup,logical_cores\n";
+
+    double t_serial = 0.0;
+    for (int n = 1; n <= max_threads; ++n) {
+        omp_set_num_threads(n);
+        const double sec = benchmark_task_a(kSched, kChunk);
+        if (n == 1) {
+            t_serial = sec;
+        }
+        const double speedup = t_serial / sec;
+        csv << n << ',' << std::setprecision(6) << sec << ',' << speedup << ','
+            << logical_cores << '\n';
+        std::cout << "threads=" << std::setw(2) << n << "  time=" << std::fixed
+                  << std::setprecision(3) << sec << " s  speedup=" << std::setprecision(2)
+                  << speedup << "x\n";
+    }
+
+    std::cout << "\nWrote benchmark_threads.csv\n";
+}
+
 // --- Task B: convolution ------------------------------------------------------
 
 std::vector<double> make_gaussian_kernel(int radius, double sigma) {
@@ -408,7 +441,8 @@ void print_usage(const char* prog) {
               << "\n"
               << "  gaussian (default) — wide 2D Gaussian blur (radius 25, sigma 8)\n"
               << "  sobel              — Sobel edge map on luminance\n"
-              << "  --benchmark-a      — sweep static/dynamic/guided chunk sizes for Task A\n";
+              << "  --benchmark-a         — sweep static/dynamic/guided chunk sizes for Task A\n"
+              << "  --benchmark-threads   — time/speedup vs threads (1 .. 2×logical cores)\n";
 }
 
 }  // namespace
@@ -416,6 +450,7 @@ void print_usage(const char* prog) {
 int main(int argc, char* argv[]) {
     FilterKind filter = FilterKind::Gaussian;
     bool benchmark_a = false;
+    bool benchmark_threads = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -427,11 +462,20 @@ int main(int argc, char* argv[]) {
             benchmark_a = true;
             continue;
         }
+        if (arg == "--benchmark-threads" || arg == "benchmark-threads") {
+            benchmark_threads = true;
+            continue;
+        }
         filter = parse_filter(arg);
     }
 
     if (benchmark_a) {
         run_scheduler_benchmark();
+        return 0;
+    }
+
+    if (benchmark_threads) {
+        run_thread_benchmark();
         return 0;
     }
 

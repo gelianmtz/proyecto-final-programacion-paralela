@@ -59,6 +59,32 @@ $env:OMP_NUM_THREADS=16      # PowerShell
 
 Re-run `--benchmark-a` after changing `OMP_NUM_THREADS` or hardware.
 
+## Thread scaling graphs (Amdahl + OS overhead)
+
+Sweep threads from 1 to 2×logical cores (uses optimal `static,16`):
+
+```bash
+./build/fractal_convolve_parallel --benchmark-threads
+python scripts/plot_scaling.py
+```
+
+Outputs in `graphs/`:
+
+- `task_a_time_vs_threads.png`
+- `task_a_speedup_vs_threads.png`
+
+### Results on this machine (16 logical cores)
+
+| Metric | Value |
+|--------|-------|
+| Serial time (1 thread) | 6.25 s |
+| Best time (16 threads) | 0.536 s |
+| Peak speedup | **11.65×** @ 16 threads |
+| Amdahl fit (threads 1–16) | **s ≈ 0.020** → theoretical limit **≈ 49×** |
+| OS overhead onset | **Thread 17** (time 0.561 s > 0.536 s at 16 threads) |
+
+Past 16 threads the runtime scheduler oversubscribes logical CPUs; the first measurable slowdown is at **17 threads**. The Amdahl asymptote (`1/s`) is the horizontal cap on the speedup plot; measured speedup stops growing near 16 threads because the serial fraction and synchronization costs dominate before the theoretical 49× limit is reachable.
+
 ## Outputs
 
 - `mandelbrot_8k.ppm` — fractal

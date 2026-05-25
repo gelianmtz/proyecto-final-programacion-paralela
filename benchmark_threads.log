@@ -1,0 +1,38 @@
+Task A thread scaling (schedule static, chunk 16)
+Logical cores: 16, sweep: 1..32 threads
+1 warmup + 3 timed runs (median)
+
+threads= 1  time=6.247 s  speedup=1.00x
+threads= 2  time=3.249 s  speedup=1.92x
+threads= 3  time=2.157 s  speedup=2.90x
+threads= 4  time=1.627 s  speedup=3.84x
+threads= 5  time=1.319 s  speedup=4.74x
+threads= 6  time=1.115 s  speedup=5.60x
+threads= 7  time=0.986 s  speedup=6.34x
+threads= 8  time=0.864 s  speedup=7.23x
+threads= 9  time=0.792 s  speedup=7.88x
+threads=10  time=0.725 s  speedup=8.61x
+threads=11  time=0.672 s  speedup=9.29x
+threads=12  time=0.625 s  speedup=9.99x
+threads=13  time=0.586 s  speedup=10.66x
+threads=14  time=0.562 s  speedup=11.12x
+threads=15  time=0.537 s  speedup=11.63x
+threads=16  time=0.536 s  speedup=11.65x
+threads=17  time=0.561 s  speedup=11.13x
+threads=18  time=0.557 s  speedup=11.21x
+threads=19  time=0.572 s  speedup=10.92x
+threads=20  time=0.553 s  speedup=11.30x
+threads=21  time=0.554 s  speedup=11.28x
+threads=22  time=0.590 s  speedup=10.59x
+threads=23  time=0.580 s  speedup=10.77x
+threads=24  time=0.579 s  speedup=10.79x
+threads=25  time=0.576 s  speedup=10.85x
+threads=26  time=0.557 s  speedup=11.22x
+threads=27  time=0.569 s  speedup=10.97x
+threads=28  time=0.569 s  speedup=10.98x
+threads=29  time=0.570 s  speedup=10.97x
+threads=30  time=0.547 s  speedup=11.42x
+threads=31  time=0.561 s  speedup=11.13x
+threads=32  time=0.579 s  speedup=10.79x
+
+Wrote benchmark_threads.csv
