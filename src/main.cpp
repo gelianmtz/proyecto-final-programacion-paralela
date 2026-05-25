@@ -351,7 +351,7 @@ void run_thread_benchmark() {
     std::cout << "\nWrote benchmark_threads.csv\n";
 }
 
-// --- Task B: convolution ------------------------------------------------------
+// --- Task B: convolution (SPMD + SIMD inner loops) ----------------------------
 
 std::vector<double> make_gaussian_kernel(int radius, double sigma) {
     const int size = 2 * radius + 1;
@@ -370,12 +370,12 @@ std::vector<double> make_gaussian_kernel(int radius, double sigma) {
     return kernel;
 }
 
-Image convolve_2d_gaussian(const Image& src, int radius, double sigma) {
+// Scalar reference (original loop nest)
+Image convolve_2d_gaussian_scalar(const Image& src, int radius, double sigma) {
     const std::vector<double> kernel = make_gaussian_kernel(radius, sigma);
     const int ksize = static_cast<int>(kernel.size());
     Image dst(src.width, src.height);
 
-#pragma omp parallel for schedule(static)
     for (int y = 0; y < src.height; ++y) {
         for (int x = 0; x < src.width; ++x) {
             for (int c = 0; c < 3; ++c) {
@@ -395,22 +395,102 @@ Image convolve_2d_gaussian(const Image& src, int radius, double sigma) {
     return dst;
 }
 
+// SPMD: one OpenMP thread = one row program; innermost x loop vectorized with omp simd
+Image convolve_2d_gaussian(const Image& src, int radius, double sigma) {
+    const std::vector<double> kernel1d = make_gaussian_kernel(radius, sigma);
+    const int ksize = static_cast<int>(kernel1d.size());
+    std::vector<double> kernel2d(static_cast<size_t>(ksize) * ksize);
+    for (int ky = 0; ky < ksize; ++ky) {
+        for (int kx = 0; kx < ksize; ++kx) {
+            kernel2d[static_cast<size_t>(ky) * ksize + kx] = kernel1d[ky] * kernel1d[kx];
+        }
+    }
+
+    const int w = src.width;
+    const int h = src.height;
+    const int x_inner0 = radius;
+    const int x_inner1 = w - radius;
+    Image dst(w, h);
+
+#pragma omp parallel for schedule(static)
+    for (int y = 0; y < h; ++y) {
+        std::vector<double> acc0(static_cast<size_t>(w), 0.0);
+        std::vector<double> acc1(static_cast<size_t>(w), 0.0);
+        std::vector<double> acc2(static_cast<size_t>(w), 0.0);
+
+        for (int ky = 0; ky < ksize; ++ky) {
+            const int sy = clamp_int(y + ky - radius, 0, h - 1);
+            const size_t row_base = static_cast<size_t>(sy) * w * 3;
+
+            for (int kx = 0; kx < ksize; ++kx) {
+                const double kw = kernel2d[static_cast<size_t>(ky) * ksize + kx];
+                const int x_shift = kx - radius;
+
+                for (int x = 0; x < x_inner0; ++x) {
+                    const int sx = clamp_int(x + x_shift, 0, w - 1);
+                    const size_t idx = row_base + static_cast<size_t>(sx) * 3;
+                    const uint8_t* p = &src.rgb[idx];
+                    acc0[static_cast<size_t>(x)] += kw * static_cast<double>(p[0]);
+                    acc1[static_cast<size_t>(x)] += kw * static_cast<double>(p[1]);
+                    acc2[static_cast<size_t>(x)] += kw * static_cast<double>(p[2]);
+                }
+
+#pragma omp simd safelen(64)
+                for (int x = x_inner0; x < x_inner1; ++x) {
+                    const int sx = x + x_shift;
+                    const size_t idx = row_base + static_cast<size_t>(sx) * 3;
+                    const uint8_t* p = &src.rgb[idx];
+                    acc0[static_cast<size_t>(x)] += kw * static_cast<double>(p[0]);
+                    acc1[static_cast<size_t>(x)] += kw * static_cast<double>(p[1]);
+                    acc2[static_cast<size_t>(x)] += kw * static_cast<double>(p[2]);
+                }
+
+                for (int x = x_inner1; x < w; ++x) {
+                    const int sx = clamp_int(x + x_shift, 0, w - 1);
+                    const size_t idx = row_base + static_cast<size_t>(sx) * 3;
+                    const uint8_t* p = &src.rgb[idx];
+                    acc0[static_cast<size_t>(x)] += kw * static_cast<double>(p[0]);
+                    acc1[static_cast<size_t>(x)] += kw * static_cast<double>(p[1]);
+                    acc2[static_cast<size_t>(x)] += kw * static_cast<double>(p[2]);
+                }
+            }
+        }
+
+#pragma omp simd safelen(64)
+        for (int x = 0; x < w; ++x) {
+            uint8_t* d = dst.pixel(x, y);
+            d[0] = to_byte(acc0[static_cast<size_t>(x)]);
+            d[1] = to_byte(acc1[static_cast<size_t>(x)]);
+            d[2] = to_byte(acc2[static_cast<size_t>(x)]);
+        }
+    }
+    return dst;
+}
+
 Image convolve_sobel(const Image& src) {
     static const int gx[3][3] = {{-1, 0, 1}, {-2, 0, 2}, {-1, 0, 1}};
     static const int gy[3][3] = {{-1, -2, -1}, {0, 0, 0}, {1, 2, 1}};
 
-    Image dst(src.width, src.height);
+    const int w = src.width;
+    const int h = src.height;
+    Image dst(w, h);
 
 #pragma omp parallel for schedule(static)
-    for (int y = 0; y < src.height; ++y) {
-        for (int x = 0; x < src.width; ++x) {
+    for (int y = 0; y < h; ++y) {
+#pragma omp simd safelen(64)
+        for (int x = 0; x < w; ++x) {
             double lum_x = 0.0;
             double lum_y = 0.0;
 
             for (int ky = -1; ky <= 1; ++ky) {
+                const int sy = clamp_int(y + ky, 0, h - 1);
+                const size_t row_base = static_cast<size_t>(sy) * w * 3;
                 for (int kx = -1; kx <= 1; ++kx) {
-                    const uint8_t* p = src.pixel(x + kx, y + ky);
-                    const double lum = 0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2];
+                    const int sx = clamp_int(x + kx, 0, w - 1);
+                    const uint8_t* p = &src.rgb[row_base + static_cast<size_t>(sx) * 3];
+                    const double lum =
+                        0.299 * static_cast<double>(p[0]) + 0.587 * static_cast<double>(p[1]) +
+                        0.114 * static_cast<double>(p[2]);
                     lum_x += gx[ky + 1][kx + 1] * lum;
                     lum_y += gy[ky + 1][kx + 1] * lum;
                 }
@@ -423,6 +503,69 @@ Image convolve_sobel(const Image& src) {
         }
     }
     return dst;
+}
+
+uint64_t max_channel_diff(const Image& a, const Image& b) {
+    uint64_t diff = 0;
+    for (size_t i = 0; i < a.rgb.size(); ++i) {
+        const uint64_t d = static_cast<uint64_t>(a.rgb[i]) > static_cast<uint64_t>(b.rgb[i])
+                               ? static_cast<uint64_t>(a.rgb[i]) - static_cast<uint64_t>(b.rgb[i])
+                               : static_cast<uint64_t>(b.rgb[i]) - static_cast<uint64_t>(a.rgb[i]);
+        diff = std::max(diff, d);
+    }
+    return diff;
+}
+
+const char* env_or(const char* name, const char* fallback) {
+    const char* v = std::getenv(name);
+    return (v && v[0] != '\0') ? v : fallback;
+}
+
+double benchmark_task_b_gaussian(const Image& src, int radius, double sigma) {
+    for (int w = 0; w < kBenchmarkWarmup; ++w) {
+        (void)convolve_2d_gaussian(src, radius, sigma);
+    }
+    std::vector<double> samples;
+    samples.reserve(kBenchmarkReps);
+    for (int r = 0; r < kBenchmarkReps; ++r) {
+        const auto t0 = std::chrono::steady_clock::now();
+        (void)convolve_2d_gaussian(src, radius, sigma);
+        const auto t1 = std::chrono::steady_clock::now();
+        samples.push_back(std::chrono::duration<double>(t1 - t0).count());
+    }
+    return median(samples);
+}
+
+void run_affinity_benchmark() {
+    constexpr int kBlurRadius = 25;
+    constexpr double kBlurSigma = 8.0;
+    constexpr ScheduleKind kSched = ScheduleKind::Static;
+    constexpr int kChunk = 16;
+
+    std::cout << "Task B affinity benchmark (SPMD + SIMD convolution)\n";
+    std::cout << "OMP_NUM_THREADS=" << env_or("OMP_NUM_THREADS", "(default)") << "\n";
+    std::cout << "OMP_PROC_BIND=" << env_or("OMP_PROC_BIND", "(unset)") << "\n";
+    std::cout << "OMP_PLACES=" << env_or("OMP_PLACES", "(unset)") << "\n";
+    std::cout << "OMP_DISPLAY_AFFINITY=" << env_or("OMP_DISPLAY_AFFINITY", "(unset)") << "\n\n";
+
+    Image fractal;
+    if (load_ppm("mandelbrot_8k.ppm", fractal)) {
+        std::cout << "Loaded mandelbrot_8k.ppm as convolution source\n";
+    } else {
+        fractal = Image(kWidth, kHeight);
+        std::cout << "Preparing source image (Task A)...\n";
+        render_mandelbrot(fractal, kSched, kChunk);
+    }
+
+    const double sec = benchmark_task_b_gaussian(fractal, kBlurRadius, kBlurSigma);
+    std::cout << std::fixed << std::setprecision(3);
+    std::cout << "Task B median time: " << sec << " s\n";
+
+    std::ofstream csv("benchmark_affinity_single.csv", std::ios::app);
+    csv << env_or("OMP_PROC_BIND", "unset") << ',' << env_or("OMP_PLACES", "unset") << ','
+        << std::setprecision(6) << sec << '\n';
+    std::cout << "Appended benchmark_affinity_single.csv (run scripts/benchmark_affinity.ps1 "
+                 "for full sweep + cache counters)\n";
 }
 
 using Histogram = std::vector<uint64_t>;
@@ -750,6 +893,25 @@ void compute_and_report_histogram(const Image& img) {
     print_histogram_summary(hist, img);
 }
 
+bool load_ppm(const std::string& path, Image& img) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return false;
+    }
+    std::string magic;
+    in >> magic >> img.width >> img.height;
+    int maxval = 0;
+    in >> maxval;
+    in.get();
+    if (magic != "P6" || maxval != 255 || img.width <= 0 || img.height <= 0) {
+        return false;
+    }
+    img.rgb.resize(static_cast<size_t>(img.width) * img.height * 3);
+    in.read(reinterpret_cast<char*>(img.rgb.data()),
+            static_cast<std::streamsize>(img.rgb.size()));
+    return static_cast<bool>(in);
+}
+
 bool write_ppm(const std::string& path, const Image& img) {
     std::ofstream out(path, std::ios::binary);
     if (!out) {
@@ -777,7 +939,8 @@ void print_usage(const char* prog) {
               << "  sobel              — Sobel edge map on luminance\n"
               << "  --benchmark-a         — sweep static/dynamic/guided chunk sizes for Task A\n"
               << "  --benchmark-threads   — time/speedup vs threads (1 .. 2×logical cores)\n"
-              << "  --benchmark-histogram — compare critical/atomic/local/reduction histograms\n";
+              << "  --benchmark-histogram — compare critical/atomic/local/reduction histograms\n"
+              << "  --benchmark-affinity  — time Task B (read OMP_PROC_BIND / OMP_PLACES from env)\n";
 }
 
 }  // namespace
@@ -787,6 +950,7 @@ int main(int argc, char* argv[]) {
     bool benchmark_a = false;
     bool benchmark_threads = false;
     bool benchmark_histogram = false;
+    bool benchmark_affinity = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -804,6 +968,10 @@ int main(int argc, char* argv[]) {
         }
         if (arg == "--benchmark-histogram" || arg == "benchmark-histogram") {
             benchmark_histogram = true;
+            continue;
+        }
+        if (arg == "--benchmark-affinity" || arg == "benchmark-affinity") {
+            benchmark_affinity = true;
             continue;
         }
         filter = parse_filter(arg);
@@ -828,6 +996,11 @@ int main(int argc, char* argv[]) {
         render_mandelbrot(fractal, kSched, kChunk);
         Image filtered = convolve_2d_gaussian(fractal, 25, 8.0);
         run_histogram_benchmark(filtered);
+        return 0;
+    }
+
+    if (benchmark_affinity) {
+        run_affinity_benchmark();
         return 0;
     }
 
@@ -861,8 +1034,10 @@ int main(int argc, char* argv[]) {
     if (filter == FilterKind::Gaussian) {
         constexpr int kBlurRadius = 25;
         constexpr double kBlurSigma = 8.0;
-        std::cout << "Task B: 2D Gaussian convolution (radius " << kBlurRadius
+        std::cout << "Task B: 2D Gaussian SPMD+SIMD convolution (radius " << kBlurRadius
                   << ", sigma " << kBlurSigma << ")\n";
+        std::cout << "  OMP_PROC_BIND=" << env_or("OMP_PROC_BIND", "(unset)") << "  OMP_PLACES="
+                  << env_or("OMP_PLACES", "(unset)") << "\n";
         filtered = convolve_2d_gaussian(fractal, kBlurRadius, kBlurSigma);
     } else {
         std::cout << "Task B: Sobel edge detection (3x3 kernels)\n";

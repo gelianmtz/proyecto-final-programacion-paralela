@@ -3,7 +3,7 @@
 OpenMP-parallel C++ pipeline:
 
 1. **Task A** — Render the Mandelbrot set at **8K UHD** (7680×4320).
-2. **Task B** — Apply a **heavy 2D convolution** (Gaussian or Sobel), parallelized by row.
+2. **Task B** — Apply a **heavy 2D convolution** (Gaussian or Sobel): **SPMD** rows + **`#pragma omp simd`** on the inner `x` loop.
 
 ## Build
 
@@ -84,6 +84,24 @@ Outputs in `graphs/`:
 | OS overhead onset | **Thread 17** (time 0.561 s > 0.536 s at 16 threads) |
 
 Past 16 threads the runtime scheduler oversubscribes logical CPUs; the first measurable slowdown is at **17 threads**. The Amdahl asymptote (`1/s`) is the horizontal cap on the speedup plot; measured speedup stops growing near 16 threads because the serial fraction and synchronization costs dominate before the theoretical 49× limit is reachable.
+
+## Task B vectorization and affinity
+
+Verify GCC vectorized the inner loops:
+
+```powershell
+.\scripts\build_vectorized.ps1
+# inspect build\vectorization_report.log
+```
+
+Measure Task B with different core bindings (and L1/LLC counters if `perf` is available):
+
+```powershell
+$env:OMP_NUM_THREADS = 16
+.\scripts\benchmark_affinity.ps1
+```
+
+Details: [docs/TASK_B_VECTORIZATION.md](docs/TASK_B_VECTORIZATION.md).
 
 ## Color histogram (Task C)
 
