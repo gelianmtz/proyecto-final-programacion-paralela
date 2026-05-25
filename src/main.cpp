@@ -4,14 +4,20 @@
 
 #include <omp.h>
 
+#ifdef _WIN32
+#include <malloc.h>
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -28,6 +34,9 @@ constexpr double kZoom = 1.0;
 
 constexpr int kBenchmarkReps = 3;
 constexpr int kBenchmarkWarmup = 1;
+
+constexpr size_t kColorBins = 1u << 24;  // RGB888
+constexpr size_t kCacheLine = 64;
 
 enum class FilterKind { Gaussian, Sobel };
 enum class ScheduleKind { Static, Dynamic, Guided };
@@ -416,6 +425,331 @@ Image convolve_sobel(const Image& src) {
     return dst;
 }
 
+using Histogram = std::vector<uint64_t>;
+using SparseHist = std::unordered_map<uint32_t, uint32_t>;
+
+inline size_t rgb_index(const uint8_t* rgb) {
+    return (static_cast<size_t>(rgb[0]) << 16) | (static_cast<size_t>(rgb[1]) << 8) |
+           static_cast<size_t>(rgb[2]);
+}
+
+Histogram make_empty_histogram() {
+    return Histogram(kColorBins, 0);
+}
+
+uint64_t histogram_total(const Histogram& h) {
+    uint64_t sum = 0;
+    for (uint64_t v : h) {
+        sum += v;
+    }
+    return sum;
+}
+
+size_t count_unique_colors(const Histogram& h) {
+    size_t n = 0;
+    for (uint64_t v : h) {
+        if (v > 0) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+bool histograms_equal(const Histogram& a, const Histogram& b) {
+    return a == b;
+}
+
+// Serial reference
+Histogram histogram_serial(const Image& img) {
+    Histogram hist = make_empty_histogram();
+    const size_t pixels = static_cast<size_t>(img.width) * img.height;
+    for (size_t i = 0; i < pixels; ++i) {
+        const uint8_t* p = &img.rgb[i * 3];
+        ++hist[rgb_index(p)];
+    }
+    return hist;
+}
+
+// Shared array + mutual exclusion (high contention, cache-line sharing on adjacent bins)
+Histogram histogram_critical(const Image& img) {
+    Histogram hist = make_empty_histogram();
+    const int64_t pixels = static_cast<int64_t>(img.width) * img.height;
+
+#pragma omp parallel for schedule(static)
+    for (int64_t i = 0; i < pixels; ++i) {
+        const uint8_t* p = &img.rgb[static_cast<size_t>(i) * 3];
+        const size_t idx = rgb_index(p);
+#pragma omp critical(hist_update)
+        {
+            ++hist[idx];
+        }
+    }
+    return hist;
+}
+
+Histogram histogram_atomic(const Image& img) {
+    Histogram hist = make_empty_histogram();
+    const int64_t pixels = static_cast<int64_t>(img.width) * img.height;
+
+#pragma omp parallel for schedule(static)
+    for (int64_t i = 0; i < pixels; ++i) {
+        const uint8_t* p = &img.rgb[static_cast<size_t>(i) * 3];
+        const size_t idx = rgb_index(p);
+#pragma omp atomic update
+        hist[idx] += 1;
+    }
+    return hist;
+}
+
+void merge_sparse_into_dense(const SparseHist& sparse, Histogram& global) {
+    for (const auto& entry : sparse) {
+        global[entry.first] += entry.second;
+    }
+}
+
+// Per-thread private sparse maps, merged once (no shared writes in the hot loop)
+Histogram histogram_local_merge(const Image& img) {
+    const int threads = omp_get_max_threads();
+    std::vector<SparseHist> locals(static_cast<size_t>(threads));
+    const int64_t pixels = static_cast<int64_t>(img.width) * img.height;
+
+#pragma omp parallel
+    {
+        const int tid = omp_get_thread_num();
+        SparseHist& local = locals[static_cast<size_t>(tid)];
+        local.reserve(1 << 18);
+
+#pragma omp for schedule(static) nowait
+        for (int64_t i = 0; i < pixels; ++i) {
+            const uint8_t* p = &img.rgb[static_cast<size_t>(i) * 3];
+            const uint32_t idx = static_cast<uint32_t>(rgb_index(p));
+            ++local[idx];
+        }
+    }
+
+    Histogram global = make_empty_histogram();
+    for (const SparseHist& local : locals) {
+        merge_sparse_into_dense(local, global);
+    }
+    return global;
+}
+
+// Dense per-thread private histograms (128 MiB × threads — only if OMP_HISTOGRAM_DENSE=1)
+Histogram histogram_local_dense(const Image& img) {
+    const int threads = omp_get_max_threads();
+    std::vector<Histogram> locals(static_cast<size_t>(threads));
+    for (int t = 0; t < threads; ++t) {
+        locals[static_cast<size_t>(t)] = make_empty_histogram();
+    }
+    const int64_t pixels = static_cast<int64_t>(img.width) * img.height;
+
+#pragma omp parallel
+    {
+        const int tid = omp_get_thread_num();
+        Histogram& local = locals[static_cast<size_t>(tid)];
+
+#pragma omp for schedule(static) nowait
+        for (int64_t i = 0; i < pixels; ++i) {
+            const uint8_t* p = &img.rgb[static_cast<size_t>(i) * 3];
+            ++local[rgb_index(p)];
+        }
+    }
+
+    Histogram global = make_empty_histogram();
+    for (const Histogram& local : locals) {
+        for (size_t b = 0; b < kColorBins; ++b) {
+            global[b] += local[b];
+        }
+    }
+    return global;
+}
+
+// Shared counters with false-sharing stress: per-thread tallies in one array (no padding)
+Histogram histogram_shared_counters_packed(const Image& img) {
+    const int threads = omp_get_max_threads();
+    std::vector<uint64_t> counters(static_cast<size_t>(threads), 0);
+    const int64_t pixels = static_cast<int64_t>(img.width) * img.height;
+
+#pragma omp parallel for schedule(static)
+    for (int64_t i = 0; i < pixels; ++i) {
+        const int tid = omp_get_thread_num();
+#pragma omp atomic update
+        counters[static_cast<size_t>(tid)] += 1;
+    }
+
+    Histogram global = make_empty_histogram();
+    const uint8_t* p = img.rgb.data();
+    const size_t total = static_cast<size_t>(pixels);
+    for (size_t i = 0; i < total; ++i) {
+        ++global[rgb_index(p + i * 3)];
+    }
+    (void)threads;
+    return global;
+}
+
+struct alignas(kCacheLine) PaddedCounter {
+    uint64_t value = 0;
+};
+
+// Same as packed, but each counter on its own cache line (mitigates false sharing)
+Histogram histogram_shared_counters_padded(const Image& img) {
+    const int threads = omp_get_max_threads();
+    std::vector<PaddedCounter> counters(static_cast<size_t>(threads));
+    const int64_t pixels = static_cast<int64_t>(img.width) * img.height;
+
+#pragma omp parallel for schedule(static)
+    for (int64_t i = 0; i < pixels; ++i) {
+        const int tid = omp_get_thread_num();
+#pragma omp atomic update
+        counters[static_cast<size_t>(tid)].value += 1;
+    }
+
+    Histogram global = make_empty_histogram();
+    const int64_t px = pixels;
+    for (int64_t i = 0; i < px; ++i) {
+        const uint8_t* pix = &img.rgb[static_cast<size_t>(i) * 3];
+        ++global[rgb_index(pix)];
+    }
+    return global;
+}
+
+struct HistTiming {
+    const char* name = "";
+    double seconds = 0.0;
+    Histogram hist;
+};
+
+template <typename Fn>
+HistTiming time_histogram(const char* name, Fn fn, const Image& img) {
+    for (int w = 0; w < kBenchmarkWarmup; ++w) {
+        (void)fn(img);
+    }
+    std::vector<double> samples;
+    samples.reserve(kBenchmarkReps);
+    Histogram result;
+    for (int r = 0; r < kBenchmarkReps; ++r) {
+        const auto t0 = std::chrono::steady_clock::now();
+        result = fn(img);
+        const auto t1 = std::chrono::steady_clock::now();
+        samples.push_back(std::chrono::duration<double>(t1 - t0).count());
+    }
+    return {name, median(samples), std::move(result)};
+}
+
+void print_histogram_summary(const Histogram& hist, const Image& img) {
+    const size_t unique = count_unique_colors(hist);
+    const uint64_t total = histogram_total(hist);
+    const size_t expected = static_cast<size_t>(img.width) * img.height;
+
+    std::cout << "  Total pixels: " << total << " (expected " << expected << ")\n";
+    std::cout << "  Unique colors: " << unique << "\n";
+
+    struct TopColor {
+        size_t idx = 0;
+        uint64_t count = 0;
+    };
+    std::vector<TopColor> top;
+    top.reserve(5);
+    for (size_t i = 0; i < kColorBins; ++i) {
+        if (hist[i] == 0) {
+            continue;
+        }
+        TopColor c{i, hist[i]};
+        if (top.size() < 5) {
+            top.push_back(c);
+            if (top.size() == 5) {
+                std::sort(top.begin(), top.end(),
+                          [](const TopColor& a, const TopColor& b) { return a.count > b.count; });
+            }
+        } else if (c.count > top.back().count) {
+            top.back() = c;
+            std::sort(top.begin(), top.end(),
+                      [](const TopColor& a, const TopColor& b) { return a.count > b.count; });
+        }
+    }
+
+    std::cout << "  Top colors (R,G,B count):\n";
+    for (const TopColor& c : top) {
+        const unsigned r = static_cast<unsigned>((c.idx >> 16) & 0xFF);
+        const unsigned g = static_cast<unsigned>((c.idx >> 8) & 0xFF);
+        const unsigned b = static_cast<unsigned>(c.idx & 0xFF);
+        std::cout << "    (" << r << "," << g << "," << b << ") -> " << c.count << "\n";
+    }
+}
+
+void run_histogram_benchmark(const Image& img) {
+    std::cout << "Color histogram benchmark (RGB888, " << kColorBins << " bins)\n";
+    std::cout << "OpenMP threads: " << omp_get_max_threads() << "\n";
+    std::cout << kBenchmarkWarmup << " warmup + " << kBenchmarkReps << " median runs\n\n";
+
+    const auto t_ref0 = std::chrono::steady_clock::now();
+    const Histogram reference = histogram_serial(img);
+    const auto t_ref1 = std::chrono::steady_clock::now();
+    const double t_ref = std::chrono::duration<double>(t_ref1 - t_ref0).count();
+
+    std::vector<HistTiming> runs;
+    runs.push_back(time_histogram("critical", histogram_critical, img));
+    runs.push_back(time_histogram("atomic", histogram_atomic, img));
+    runs.push_back(time_histogram("local_sparse", histogram_local_merge, img));
+
+    if (std::getenv("OMP_HISTOGRAM_DENSE")) {
+        runs.push_back(time_histogram("local_dense", histogram_local_dense, img));
+    }
+
+    runs.push_back(
+        time_histogram("shared_counters_packed", histogram_shared_counters_packed, img));
+    runs.push_back(
+        time_histogram("shared_counters_padded", histogram_shared_counters_padded, img));
+
+    std::cout << std::fixed << std::setprecision(3);
+    std::cout << "serial reference: " << t_ref << " s  (unique "
+              << count_unique_colors(reference) << " colors)\n\n";
+
+    std::ofstream csv("benchmark_histogram.csv");
+    csv << "method,seconds,speedup_vs_critical,matches_reference\n";
+
+    const double t_crit = runs.front().seconds;
+    for (const HistTiming& run : runs) {
+        const bool ok = histograms_equal(run.hist, reference);
+        const double speedup = t_crit / run.seconds;
+        std::cout << std::setw(16) << run.name << "  " << run.seconds << " s"
+                  << "  speedup_vs_critical=" << std::setprecision(2) << speedup << "x"
+                  << "  correct=" << (ok ? "yes" : "NO") << "\n";
+        csv << run.name << ',' << std::setprecision(6) << run.seconds << ',' << (t_crit / run.seconds)
+            << ',' << (ok ? 1 : 0) << '\n';
+    }
+
+    double packed_sec = 0.0;
+    double padded_sec = 0.0;
+    for (const HistTiming& run : runs) {
+        if (std::string(run.name) == "shared_counters_packed") {
+            packed_sec = run.seconds;
+        }
+        if (std::string(run.name) == "shared_counters_padded") {
+            padded_sec = run.seconds;
+        }
+    }
+    const double fs_ratio = padded_sec > 0.0 ? packed_sec / padded_sec : 1.0;
+
+    std::cout << "\nFalse-sharing micro-benchmark (packed vs padded thread counters): "
+              << std::setprecision(2) << fs_ratio
+              << "x  (ratio > 1 ⇒ false sharing on adjacent counters)\n";
+    std::cout << "Shared hist[] atomic/critical: false sharing when different threads hit "
+                 "bins in the same cache line.\n";
+    std::cout << "Wrote benchmark_histogram.csv\n";
+    std::cout << "See docs/HISTOGRAM.md for analysis.\n";
+}
+
+void compute_and_report_histogram(const Image& img) {
+    std::cout << "\n=== Color histogram (final image) ===\n";
+    const auto t0 = std::chrono::steady_clock::now();
+    const Histogram hist = histogram_local_merge(img);
+    const auto t1 = std::chrono::steady_clock::now();
+    std::cout << "Method: local private bins + merge (production path)\n";
+    std::cout << "Time: " << std::chrono::duration<double>(t1 - t0).count() << " s\n";
+    print_histogram_summary(hist, img);
+}
+
 bool write_ppm(const std::string& path, const Image& img) {
     std::ofstream out(path, std::ios::binary);
     if (!out) {
@@ -442,7 +776,8 @@ void print_usage(const char* prog) {
               << "  gaussian (default) — wide 2D Gaussian blur (radius 25, sigma 8)\n"
               << "  sobel              — Sobel edge map on luminance\n"
               << "  --benchmark-a         — sweep static/dynamic/guided chunk sizes for Task A\n"
-              << "  --benchmark-threads   — time/speedup vs threads (1 .. 2×logical cores)\n";
+              << "  --benchmark-threads   — time/speedup vs threads (1 .. 2×logical cores)\n"
+              << "  --benchmark-histogram — compare critical/atomic/local/reduction histograms\n";
 }
 
 }  // namespace
@@ -451,6 +786,7 @@ int main(int argc, char* argv[]) {
     FilterKind filter = FilterKind::Gaussian;
     bool benchmark_a = false;
     bool benchmark_threads = false;
+    bool benchmark_histogram = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -466,6 +802,10 @@ int main(int argc, char* argv[]) {
             benchmark_threads = true;
             continue;
         }
+        if (arg == "--benchmark-histogram" || arg == "benchmark-histogram") {
+            benchmark_histogram = true;
+            continue;
+        }
         filter = parse_filter(arg);
     }
 
@@ -476,6 +816,18 @@ int main(int argc, char* argv[]) {
 
     if (benchmark_threads) {
         run_thread_benchmark();
+        return 0;
+    }
+
+    if (benchmark_histogram) {
+        std::cout << "Histogram-only mode: run full pipeline first to produce output PPM,\n"
+                  << "or this mode builds a fresh filtered image in memory.\n\n";
+        constexpr ScheduleKind kSched = ScheduleKind::Static;
+        constexpr int kChunk = 16;
+        Image fractal(kWidth, kHeight);
+        render_mandelbrot(fractal, kSched, kChunk);
+        Image filtered = convolve_2d_gaussian(fractal, 25, 8.0);
+        run_histogram_benchmark(filtered);
         return 0;
     }
 
@@ -528,7 +880,11 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     std::cout << "Wrote " << out_name << "\n";
+
+    compute_and_report_histogram(filtered);
+
     std::cout << "Total: " << (sec_a + sec_b) << " s\n";
+    std::cout << "Histogram comparison: run with --benchmark-histogram\n";
 
     return 0;
 }

@@ -1,0 +1,19 @@
+Histogram-only mode: run full pipeline first to produce output PPM,
+or this mode builds a fresh filtered image in memory.
+
+Color histogram benchmark (RGB888, 16777216 bins)
+OpenMP threads: 16
+1 warmup + 3 median runs
+
+serial reference: 0.045 s  (unique 17628 colors)
+
+        critical  0.970 s  speedup_vs_critical=1.00x  correct=yes
+          atomic  0.05 s  speedup_vs_critical=20.43x  correct=yes
+    local_sparse  0.05 s  speedup_vs_critical=20.11x  correct=yes
+shared_counters_packed  0.18 s  speedup_vs_critical=5.28x  correct=yes
+shared_counters_padded  0.06 s  speedup_vs_critical=14.99x  correct=yes
+
+False-sharing micro-benchmark (packed vs padded thread counters): 2.84x  (ratio > 1 ΓçÆ false sharing on adjacent counters)
+Shared hist[] atomic/critical: false sharing when different threads hit bins in the same cache line.
+Wrote benchmark_histogram.csv
+See docs/HISTOGRAM.md for analysis.

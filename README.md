@@ -85,8 +85,21 @@ Outputs in `graphs/`:
 
 Past 16 threads the runtime scheduler oversubscribes logical CPUs; the first measurable slowdown is at **17 threads**. The Amdahl asymptote (`1/s`) is the horizontal cap on the speedup plot; measured speedup stops growing near 16 threads because the serial fraction and synchronization costs dominate before the theoretical 49× limit is reachable.
 
+## Color histogram (Task C)
+
+After filtering, the pipeline builds an **RGB888 histogram** (count per `(R,G,B)` color) using private per-thread bins + merge.
+
+Compare synchronization strategies (mutual exclusion vs local/reduction):
+
+```bash
+./build/fractal_convolve_parallel --benchmark-histogram
+```
+
+Writes `benchmark_histogram.csv`. Analysis of **false sharing** on shared vs private arrays: [docs/HISTOGRAM.md](docs/HISTOGRAM.md).
+
 ## Outputs
 
 - `mandelbrot_8k.ppm` — fractal
 - `mandelbrot_8k_blur.ppm` or `mandelbrot_8k_sobel.ppm` — filtered image
 - `benchmark_task_a.csv` — scheduler sweep results
+- `benchmark_histogram.csv` — histogram method timings

@@ -1,0 +1,6 @@
+method,seconds,speedup_vs_critical,matches_reference
+critical,0.969584,1,1
+atomic,0.0474692,20.4255,1
+local_sparse,0.048214,20.11,1
+shared_counters_packed,0.183601,5.28092,1
+shared_counters_padded,0.064661,14.9949,1
